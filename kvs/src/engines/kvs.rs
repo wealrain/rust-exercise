@@ -14,9 +14,11 @@ use serde_json::Deserializer;
 
 use crate::{KvsError,Result};
 
+use super::KvsEngine;
+
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
-/// KvStore存储String类型的kv键值对，使用hashmap进行存储
+/// KvStore存储String类型的kv键值对，使用BTreeMap进行存储
 /// 支持set get rm操作
 /// kv键值对将会被持久化存储在日志文件中
 /// 采用BTreeMap 提高查询速度
@@ -43,9 +45,10 @@ impl KvStore {
 
         // 加载并排序日志文件
         let gen_list = sorted_gen_list(&path)?;
+        // 定义操作数据占用空间 (未压缩数据)
         let mut uncompacted = 0;
 
-        // 遍历所有日志文件，读入数据存储到index中
+        // 遍历所有日志文件，将数据读取到内存中，并在内存中映射文件和文件流的关系
         for &gen in &gen_list {
             let mut reader = BufReaderWithPos::new(File::open(log_path(&path,gen))?)?;
             uncompacted += load(gen,&mut reader,&mut index)?;
@@ -64,71 +67,18 @@ impl KvStore {
     //     KvStore { map: HashMap::new() }
     // }
 
-    /// 存储键值，如果键已存在，值将被覆盖
-    pub fn set(&mut self,key:String,value:String) -> Result<()> {
-        // self.map.insert(key, value);
-        let cmd = Command::Set { key, value };
-        let pos = self.writer.pos;
-        serde_json::to_writer(&mut self.writer, &cmd)?;
-        self.writer.flush()?;
-        if let Command::Set { key, ..} = cmd {
-            if let Some(old_cmd) = self.index.insert(key, (self.current_gen,pos..self.writer.pos).into()) {
-                self.uncompacted += old_cmd.len;
-            }
-        }
+   
 
-        if self.uncompacted > COMPACTION_THRESHOLD {
-            self.compact()?;
-        }
-
-        Ok(())
-
-    }
-
-    /// 从存储中获取值，值可能不存在
-    pub fn get(&mut self,key:String) -> Result<Option<String>> {
-        if let Some(cmd_pos) = self.index.get(&key) {
-            let reader = self 
-                .readers
-                .get_mut(&cmd_pos.gen)
-                .expect("Cannot find log reader");
-            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
-            let cmd_reader = reader.take(cmd_pos.len);
-            if let Command::Set {  value,.. } = serde_json::from_reader(cmd_reader)?{
-                Ok(Some(value))
-            } else {
-                Err(KvsError::UnexceptedCommandType)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// 从存储中删除键值对
-    pub fn remove(&mut self,key:String) -> Result<()> {
-        if self.index.contains_key(&key) {
-            let cmd = Command::Remove { key };
-            serde_json::to_writer(&mut self.writer, &cmd)?;
-            self.writer.flush()?;
-            if let Command::Remove { key } = cmd {
-                let old_cmd = self.index.remove(&key).expect("Key not found");
-                self.uncompacted += old_cmd.len;
-            }
-            Ok(())
-        } else {
-            Err(KvsError::KeyNotFound)
-        }
-    }
-
-    /// Clears stale entries in the log.
+    /// 
     pub fn compact(&mut self) -> Result<()> {
+        // 构建新的文件作为压缩后的日志存储，并将当前的操作执行新的日志文件
         let compaction_gen = self.current_gen + 1;
         self.current_gen += 2;
         self.writer = self.new_log_file(self.current_gen)?;
-
         let mut compaction_writer = self.new_log_file(compaction_gen)?;
 
         let mut new_pos = 0;
+        // 遍历当前内存中所有的数据
         for cmd_pos in &mut self.index.values_mut() {
             let reader = self
                 .readers
@@ -168,6 +118,68 @@ impl KvStore {
     }
 }
 
+impl KvsEngine for KvStore {
+    /// 存储键值，如果键已存在，值将被覆盖
+    fn set(&mut self,key:String,value:String) -> Result<()> {
+        // self.map.insert(key, value);
+        // 构建指令
+        let cmd = Command::Set { key, value };
+        // 将指令写入到日志文件的结尾
+        let pos = self.writer.pos;
+        serde_json::to_writer(&mut self.writer, &cmd)?;
+        self.writer.flush()?;
+        // 将数据存入到内存，并累加日志大小
+        if let Command::Set { key, ..} = cmd {
+            if let Some(old_cmd) = self.index.insert(key, (self.current_gen,pos..self.writer.pos).into()) {
+                self.uncompacted += old_cmd.len;
+            }
+        }
+
+        // 如果日志大小超过阈值进行压缩
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+
+        Ok(())
+
+    }
+
+    /// 从存储中获取值，值可能不存在
+    fn get(&mut self,key:String) -> Result<Option<String>> {
+        if let Some(cmd_pos) = self.index.get(&key) {
+            let reader = self 
+                .readers
+                .get_mut(&cmd_pos.gen)
+                .expect("Cannot find log reader");
+            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
+            let cmd_reader = reader.take(cmd_pos.len);
+            if let Command::Set {  value,.. } = serde_json::from_reader(cmd_reader)?{
+                Ok(Some(value))
+            } else {
+                Err(KvsError::UnexceptedCommandType)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 从存储中删除键值对
+    fn remove(&mut self,key:String) -> Result<()> {
+        if self.index.contains_key(&key) {
+            let cmd = Command::Remove { key };
+            serde_json::to_writer(&mut self.writer, &cmd)?;
+            self.writer.flush()?;
+            if let Command::Remove { key } = cmd {
+                let old_cmd = self.index.remove(&key).expect("Key not found");
+                self.uncompacted += old_cmd.len;
+            }
+            Ok(())
+        } else {
+            Err(KvsError::KeyNotFound)
+        }
+    }
+}
+
 /// 新建一个日志文件
 fn new_log_file(path:&Path,gen:u64,readers:  &mut HashMap<u64, BufReaderWithPos<File>>) -> Result<BufWriterWithPos<File>> {
     let path = log_path(&path, gen);
@@ -182,8 +194,9 @@ fn new_log_file(path:&Path,gen:u64,readers:  &mut HashMap<u64, BufReaderWithPos<
     Ok(writer)
 }
 
+/// 加载日志文件，将日志数据转换为操作存储到内存中，并返回日志大小
 fn load(gen: u64,reader: &mut BufReaderWithPos<File>,index: &mut BTreeMap<String,CommandPos>) -> Result<u64> {
-    // read from the beginning of the file
+    // 定位到文件头，按照Command进行反序列化读取
     let mut pos = reader.seek(SeekFrom::Start(0))?;
     let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
     let mut uncompacted = 0;

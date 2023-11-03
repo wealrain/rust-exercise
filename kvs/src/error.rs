@@ -1,5 +1,5 @@
 use failure::Fail;
-use std::io;
+use std::{io, string::FromUtf8Error};
 
 ///error types
 #[derive(Fail,Debug)]
@@ -15,7 +15,16 @@ pub enum KvsError {
     KeyNotFound,
     /// 命令不存在
     #[fail(display = "Unexcepted command type")]
-    UnexceptedCommandType
+    UnexceptedCommandType,
+    ///
+    #[fail(display = "{}",_0)]
+    StringError(String),
+     ///
+     #[fail(display = "UTF-8 error: {}",_0)]
+     Utf8(#[cause] FromUtf8Error),
+     ///
+     #[fail(display = "sled error: {}", _0)]
+     Sled(#[cause] sled::Error),
 }
 
 impl From<io::Error> for KvsError {
@@ -27,6 +36,18 @@ impl From<io::Error> for KvsError {
 impl From<serde_json::Error> for KvsError {
     fn from(value: serde_json::Error) -> Self {
         KvsError::Serde(value)
+    }
+}
+
+impl From<FromUtf8Error> for KvsError {
+    fn from(value: FromUtf8Error) -> Self {
+        KvsError::Utf8(value)
+    }
+}
+
+impl From<sled::Error> for KvsError {
+    fn from(err: sled::Error) -> KvsError {
+        KvsError::Sled(err)
     }
 }
 
