@@ -1,13 +1,13 @@
 use crate::Result;
 
 /// kvs engine 定义
-pub trait KvsEngine {
+pub trait KvsEngine: Clone + Send + 'static {
   /// 插入数据
-  fn set(&mut self, key: String, value: String) -> Result<()>;
+  fn set(&self, key: String, value: String) -> Result<()>;
   /// 获取数据
-  fn get(&mut self, key: String) -> Result<Option<String>>;
+  fn get(&self, key: String) -> Result<Option<String>>;
   /// 删除数据
-  fn remove(&mut self, key: String) -> Result<()>;
+  fn remove(&self, key: String) -> Result<()>;
 }
 
 mod kvs;
